@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
+use serde::Serialize;
 use std::fmt;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::thread;
 use std::time::Duration;
 use url::Url;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PortState {
     Open,
     Closed,
@@ -22,13 +25,13 @@ impl fmt::Display for PortState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PortResult {
     pub port: u16,
     pub state: PortState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WebReport {
     pub final_url: String,
     pub status: u16,
@@ -40,7 +43,7 @@ pub struct WebReport {
     pub sitemap_present: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HeaderCheck {
     pub name: &'static str,
     pub present: bool,
@@ -48,11 +51,12 @@ pub struct HeaderCheck {
 }
 
 pub fn scan_ports(host: &str, ports: &[u16], timeout: Duration) -> Vec<PortResult> {
-    ports
-        .iter()
-        .copied()
-        .map(|port| {
-            let state = resolve_socket_addrs(host, port)
+    let mut handles = Vec::with_capacity(ports.len());
+
+    for (index, port) in ports.iter().copied().enumerate() {
+        let host = host.to_string();
+        handles.push(thread::spawn(move || {
+            let state = resolve_socket_addrs(&host, port)
                 .map(|mut addrs| {
                     addrs
                         .find(|addr| TcpStream::connect_timeout(addr, timeout).is_ok())
@@ -61,9 +65,17 @@ pub fn scan_ports(host: &str, ports: &[u16], timeout: Duration) -> Vec<PortResul
                 })
                 .unwrap_or(PortState::Unresolved);
 
-            PortResult { port, state }
-        })
-        .collect()
+            (index, PortResult { port, state })
+        }));
+    }
+
+    let mut ordered = vec![None; ports.len()];
+    for handle in handles {
+        let (index, result) = handle.join().expect("port scan thread panicked");
+        ordered[index] = Some(result);
+    }
+
+    ordered.into_iter().flatten().collect()
 }
 
 pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
@@ -95,8 +107,19 @@ pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
     })
     .collect();
 
-    let robots_txt_present = is_public_resource_present(client, base_url, "/robots.txt");
-    let sitemap_present = is_public_resource_present(client, base_url, "/sitemap.xml");
+    let robots_url = base_url.join("robots.txt").ok();
+    let sitemap_url = base_url.join("sitemap.xml").ok();
+    let robots_client = client.clone();
+    let sitemap_client = client.clone();
+
+    let robots_handle = thread::spawn(move || match robots_url {
+        Some(url) => is_public_resource_present(&robots_client, &url),
+        None => false,
+    });
+    let sitemap_handle = thread::spawn(move || match sitemap_url {
+        Some(url) => is_public_resource_present(&sitemap_client, &url),
+        None => false,
+    });
 
     Ok(WebReport {
         final_url,
@@ -114,18 +137,16 @@ pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
         security_headers,
-        robots_txt_present,
-        sitemap_present,
+        robots_txt_present: robots_handle.join().expect("robots probe thread panicked"),
+        sitemap_present: sitemap_handle
+            .join()
+            .expect("sitemap probe thread panicked"),
     })
 }
 
-fn is_public_resource_present(client: &Client, base_url: &Url, path: &str) -> bool {
-    let Ok(url) = base_url.join(path) else {
-        return false;
-    };
-
+fn is_public_resource_present(client: &Client, url: &Url) -> bool {
     client
-        .get(url)
+        .get(url.as_str())
         .send()
         .map(|response| response.status().is_success())
         .unwrap_or(false)

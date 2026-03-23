@@ -1,25 +1,87 @@
+use serde::Serialize;
 use url::Url;
 
 use crate::file::PathProbe;
 use crate::rate_limit::RateLimitReport;
 use crate::scanner::{PortResult, WebReport};
 
-pub fn print_report(
-    base_url: &Url,
-    host: &str,
-    port_report: Vec<PortResult>,
-    web_report: WebReport,
-    path_report: Vec<PathProbe>,
-    rate_report: RateLimitReport,
-) {
-    println!("Target URL: {base_url}");
-    println!("Host for TCP checks: {host}");
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditReport {
+    pub target_url: String,
+    pub host: String,
+    pub ports: Vec<PortResult>,
+    pub web: WebReport,
+    pub paths: Vec<PathProbe>,
+    pub rate_limit: RateLimitReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebOutput {
+    pub target_url: String,
+    pub web: WebReport,
+    pub paths: Vec<PathProbe>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PortsOutput {
+    pub host: String,
+    pub ports: Vec<PortResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RateOutput {
+    pub target_url: String,
+    pub rate_limit: RateLimitReport,
+}
+
+pub fn emit_audit_report(report: &AuditReport, output: OutputFormat) {
+    match output {
+        OutputFormat::Text => print_report(report),
+        OutputFormat::Json => print_json(report),
+    }
+}
+
+pub fn emit_ports_report(report: &PortsOutput, output: OutputFormat) {
+    match output {
+        OutputFormat::Text => print_port_report(&report.host, &report.ports),
+        OutputFormat::Json => print_json(report),
+    }
+}
+
+pub fn emit_web_report(report: &WebOutput, output: OutputFormat) {
+    match output {
+        OutputFormat::Text => print_web_report_from_data(report),
+        OutputFormat::Json => print_json(report),
+    }
+}
+
+pub fn emit_rate_report(report: &RateOutput, output: OutputFormat) {
+    match output {
+        OutputFormat::Text => print_rate_report_from_data(report),
+        OutputFormat::Json => print_json(report),
+    }
+}
+
+fn print_report(report: &AuditReport) {
+    println!("Target URL: {}", report.target_url);
+    println!("Host for TCP checks: {}", report.host);
     println!();
-    print_port_report(host, &port_report);
+    print_port_report(&report.host, &report.ports);
     println!();
-    print_web_report(base_url, web_report, path_report);
+    print_web_report(
+        &parse_url(&report.target_url),
+        report.web.clone(),
+        report.paths.clone(),
+    );
     println!();
-    print_rate_report(base_url, rate_report);
+    print_rate_report(&parse_url(&report.target_url), report.rate_limit.clone());
 }
 
 pub fn print_port_report(host: &str, port_report: &[PortResult]) {
@@ -92,10 +154,36 @@ pub fn print_rate_report(base_url: &Url, rate_report: RateLimitReport) {
     }
 }
 
+fn print_web_report_from_data(report: &WebOutput) {
+    print_web_report(
+        &parse_url(&report.target_url),
+        report.web.clone(),
+        report.paths.clone(),
+    );
+}
+
+fn print_rate_report_from_data(report: &RateOutput) {
+    print_rate_report(&parse_url(&report.target_url), report.rate_limit.clone());
+}
+
+fn print_json<T: Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("error: failed to serialize JSON output: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value {
         "yes"
     } else {
         "no"
     }
+}
+
+fn parse_url(input: &str) -> Url {
+    Url::parse(input).expect("stored report URL should always be valid")
 }

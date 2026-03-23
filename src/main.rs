@@ -4,15 +4,34 @@ mod report;
 mod scanner;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::blocking::Client;
+use std::thread;
 use std::time::Duration;
 use url::Url;
 
 use crate::file::probe_common_paths;
 use crate::rate_limit::probe_rate_limiting;
-use crate::report::print_report;
+use crate::report::{
+    emit_audit_report, emit_ports_report, emit_rate_report, emit_web_report, AuditReport,
+    OutputFormat, PortsOutput, RateOutput, WebOutput,
+};
 use crate::scanner::{scan_ports, web_probe};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliOutputFormat {
+    Text,
+    Json,
+}
+
+impl From<CliOutputFormat> for OutputFormat {
+    fn from(value: CliOutputFormat) -> Self {
+        match value {
+            CliOutputFormat::Text => OutputFormat::Text,
+            CliOutputFormat::Json => OutputFormat::Json,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -53,6 +72,8 @@ enum Commands {
         rate_requests: usize,
         #[arg(long, default_value_t = 10, help = "HTTP timeout in seconds")]
         timeout_secs: u64,
+        #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
+        output: CliOutputFormat,
     },
     Ports {
         #[arg(help = "Host or IP address for TCP connect checks")]
@@ -61,6 +82,8 @@ enum Commands {
         ports: Vec<u16>,
         #[arg(long, default_value_t = 800)]
         timeout_ms: u64,
+        #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
+        output: CliOutputFormat,
     },
     Web {
         #[arg(help = "Base URL to inspect")]
@@ -69,6 +92,8 @@ enum Commands {
         paths: Vec<String>,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+        #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
+        output: CliOutputFormat,
     },
     Rate {
         #[arg(help = "Base URL to test for visible rate limiting")]
@@ -77,6 +102,8 @@ enum Commands {
         requests: usize,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+        #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
+        output: CliOutputFormat,
     },
 }
 
@@ -98,6 +125,7 @@ fn run() -> Result<()> {
             paths,
             rate_requests,
             timeout_secs,
+            output,
         } => {
             let base_url = parse_url(&url)?;
             let client = build_client(timeout_secs)?;
@@ -108,48 +136,91 @@ fn run() -> Result<()> {
                     .unwrap_or_else(|| "localhost".to_string())
             });
 
-            let port_report = scan_ports(&target_host, &ports, Duration::from_millis(800));
-            let web_report = web_probe(&client, &base_url)?;
-            let path_report = probe_common_paths(&client, &base_url, &paths)?;
-            let rate_report = probe_rate_limiting(&client, &base_url, rate_requests)?;
+            let ports_for_thread = ports.clone();
+            let paths_for_thread = paths.clone();
+            let base_for_web = base_url.clone();
+            let base_for_paths = base_url.clone();
+            let base_for_rate = base_url.clone();
+            let host_for_ports = target_host.clone();
+            let port_handle = thread::spawn(move || {
+                scan_ports(
+                    &host_for_ports,
+                    &ports_for_thread,
+                    Duration::from_millis(800),
+                )
+            });
+            let web_client = client.clone();
+            let web_handle = thread::spawn(move || web_probe(&web_client, &base_for_web));
+            let path_client = client.clone();
+            let path_handle = thread::spawn(move || {
+                probe_common_paths(&path_client, &base_for_paths, &paths_for_thread)
+            });
+            let rate_client = client.clone();
+            let rate_handle = thread::spawn(move || {
+                probe_rate_limiting(&rate_client, &base_for_rate, rate_requests)
+            });
 
-            print_report(
-                &base_url,
-                &target_host,
-                port_report,
-                web_report,
-                path_report,
-                rate_report,
-            );
+            let report = AuditReport {
+                target_url: base_url.to_string(),
+                host: target_host,
+                ports: port_handle.join().expect("port scan thread panicked"),
+                web: web_handle.join().expect("web probe thread panicked")?,
+                paths: path_handle.join().expect("path probe thread panicked")?,
+                rate_limit: rate_handle.join().expect("rate-limit thread panicked")?,
+            };
+
+            emit_audit_report(&report, output.into());
         }
         Commands::Ports {
             host,
             ports,
             timeout_ms,
+            output,
         } => {
-            let report = scan_ports(&host, &ports, Duration::from_millis(timeout_ms));
-            report::print_port_report(&host, &report);
+            let report = PortsOutput {
+                host: host.clone(),
+                ports: scan_ports(&host, &ports, Duration::from_millis(timeout_ms)),
+            };
+            emit_ports_report(&report, output.into());
         }
         Commands::Web {
             url,
             paths,
             timeout_secs,
+            output,
         } => {
             let base_url = parse_url(&url)?;
             let client = build_client(timeout_secs)?;
-            let web_report = web_probe(&client, &base_url)?;
-            let path_report = probe_common_paths(&client, &base_url, &paths)?;
-            report::print_web_report(&base_url, web_report, path_report);
+            let web_client = client.clone();
+            let path_client = client.clone();
+            let web_base = base_url.clone();
+            let path_base = base_url.clone();
+            let path_values = paths.clone();
+
+            let web_handle = thread::spawn(move || web_probe(&web_client, &web_base));
+            let path_handle =
+                thread::spawn(move || probe_common_paths(&path_client, &path_base, &path_values));
+
+            let report = WebOutput {
+                target_url: base_url.to_string(),
+                web: web_handle.join().expect("web probe thread panicked")?,
+                paths: path_handle.join().expect("path probe thread panicked")?,
+            };
+            emit_web_report(&report, output.into());
         }
         Commands::Rate {
             url,
             requests,
             timeout_secs,
+            output,
         } => {
             let base_url = parse_url(&url)?;
             let client = build_client(timeout_secs)?;
-            let rate_report = probe_rate_limiting(&client, &base_url, requests)?;
-            report::print_rate_report(&base_url, rate_report);
+            let report = RateOutput {
+                target_url: base_url.to_string(),
+                rate_limit: probe_rate_limiting(&client, &base_url, requests)?,
+            };
+            emit_rate_report(&report, output.into());
         }
     }
 
