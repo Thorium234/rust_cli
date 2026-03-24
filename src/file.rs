@@ -1,6 +1,8 @@
 use anyhow::Result;
 use reqwest::blocking::Client;
 use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use url::Url;
 
@@ -27,14 +29,38 @@ pub fn probe_common_paths(
     client: &Client,
     base_url: &Url,
     extra_paths: &[String],
+    workers: usize,
 ) -> Result<Vec<PathProbe>> {
     let paths = build_probe_paths(extra_paths);
-    let mut handles = Vec::with_capacity(paths.len());
+    let worker_count = worker_count_for_len(workers, paths.len());
+    let queue: Arc<Mutex<VecDeque<(usize, String)>>> =
+        Arc::new(Mutex::new(paths.into_iter().enumerate().collect()));
+    let base_url = Arc::new(base_url.clone());
+    let results = Arc::new(Mutex::new(vec![
+        None;
+        queue
+            .lock()
+            .expect("path queue lock poisoned")
+            .len()
+    ]));
 
-    for (index, path) in paths.into_iter().enumerate() {
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
         let client = client.clone();
-        let base_url = base_url.clone();
-        handles.push(thread::spawn(move || {
+        let queue = Arc::clone(&queue);
+        let base_url = Arc::clone(&base_url);
+        let results = Arc::clone(&results);
+
+        handles.push(thread::spawn(move || loop {
+            let job = {
+                let mut queue = queue.lock().expect("path queue lock poisoned");
+                queue.pop_front()
+            };
+
+            let Some((index, path)) = job else {
+                break;
+            };
+
             let status = base_url
                 .join(path.trim_start_matches('/'))
                 .ok()
@@ -42,24 +68,26 @@ pub fn probe_common_paths(
                 .map(|response| response.status().as_u16());
 
             let interesting = is_interesting_status(status);
-            (
-                index,
-                PathProbe {
-                    path,
-                    status,
-                    interesting,
-                },
-            )
+            let mut results = results.lock().expect("path results lock poisoned");
+            results[index] = Some(PathProbe {
+                path,
+                status,
+                interesting,
+            });
         }));
     }
 
-    let mut ordered = vec![None; handles.len()];
     for handle in handles {
-        let (index, probe) = handle.join().expect("path probe thread panicked");
-        ordered[index] = Some(probe);
+        handle.join().expect("path probe worker panicked");
     }
 
-    Ok(ordered.into_iter().flatten().collect())
+    Ok(Arc::try_unwrap(results)
+        .expect("path results still referenced")
+        .into_inner()
+        .expect("path results lock poisoned")
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 pub fn build_probe_paths(extra_paths: &[String]) -> Vec<String> {
@@ -91,6 +119,10 @@ pub fn is_interesting_status(status: Option<u16>) -> bool {
         status,
         Some(200 | 201 | 202 | 204 | 301 | 302 | 307 | 401 | 403)
     )
+}
+
+fn worker_count_for_len(requested: usize, len: usize) -> usize {
+    requested.max(1).min(len.max(1))
 }
 
 #[cfg(test)]

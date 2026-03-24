@@ -5,6 +5,8 @@ use crate::file::PathProbe;
 use crate::rate_limit::RateLimitReport;
 use crate::scanner::{PortResult, WebReport};
 
+pub const SCHEMA_VERSION: &str = "v1";
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
@@ -14,8 +16,10 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditReport {
+    pub schema_version: &'static str,
     pub target_url: String,
     pub host: String,
+    pub worker_count: usize,
     pub ports: Vec<PortResult>,
     pub web: WebReport,
     pub paths: Vec<PathProbe>,
@@ -24,21 +28,87 @@ pub struct AuditReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WebOutput {
+    pub schema_version: &'static str,
     pub target_url: String,
+    pub worker_count: usize,
     pub web: WebReport,
     pub paths: Vec<PathProbe>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PortsOutput {
+    pub schema_version: &'static str,
     pub host: String,
+    pub worker_count: usize,
     pub ports: Vec<PortResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RateOutput {
+    pub schema_version: &'static str,
     pub target_url: String,
     pub rate_limit: RateLimitReport,
+}
+
+impl AuditReport {
+    pub fn new(
+        target_url: String,
+        host: String,
+        worker_count: usize,
+        ports: Vec<PortResult>,
+        web: WebReport,
+        paths: Vec<PathProbe>,
+        rate_limit: RateLimitReport,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            target_url,
+            host,
+            worker_count,
+            ports,
+            web,
+            paths,
+            rate_limit,
+        }
+    }
+}
+
+impl WebOutput {
+    pub fn new(
+        target_url: String,
+        worker_count: usize,
+        web: WebReport,
+        paths: Vec<PathProbe>,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            target_url,
+            worker_count,
+            web,
+            paths,
+        }
+    }
+}
+
+impl PortsOutput {
+    pub fn new(host: String, worker_count: usize, ports: Vec<PortResult>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            host,
+            worker_count,
+            ports,
+        }
+    }
+}
+
+impl RateOutput {
+    pub fn new(target_url: String, rate_limit: RateLimitReport) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            target_url,
+            rate_limit,
+        }
+    }
 }
 
 pub fn emit_audit_report(report: &AuditReport, output: OutputFormat) {
@@ -72,6 +142,7 @@ pub fn emit_rate_report(report: &RateOutput, output: OutputFormat) {
 fn print_report(report: &AuditReport) {
     println!("Target URL: {}", report.target_url);
     println!("Host for TCP checks: {}", report.host);
+    println!("Worker count: {}", report.worker_count);
     println!();
     print_port_report(&report.host, &report.ports);
     println!();
@@ -155,6 +226,7 @@ pub fn print_rate_report(base_url: &Url, rate_report: RateLimitReport) {
 }
 
 fn print_web_report_from_data(report: &WebOutput) {
+    println!("Worker count: {}", report.worker_count);
     print_web_report(
         &parse_url(&report.target_url),
         report.web.clone(),

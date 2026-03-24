@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::fmt;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -50,12 +52,28 @@ pub struct HeaderCheck {
     pub value: Option<String>,
 }
 
-pub fn scan_ports(host: &str, ports: &[u16], timeout: Duration) -> Vec<PortResult> {
-    let mut handles = Vec::with_capacity(ports.len());
+pub fn scan_ports(host: &str, ports: &[u16], timeout: Duration, workers: usize) -> Vec<PortResult> {
+    let worker_count = worker_count_for_len(workers, ports.len());
+    let queue: Arc<Mutex<VecDeque<(usize, u16)>>> =
+        Arc::new(Mutex::new(ports.iter().copied().enumerate().collect()));
+    let host = Arc::new(host.to_string());
+    let results = Arc::new(Mutex::new(vec![None; ports.len()]));
 
-    for (index, port) in ports.iter().copied().enumerate() {
-        let host = host.to_string();
-        handles.push(thread::spawn(move || {
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let host = Arc::clone(&host);
+        let results = Arc::clone(&results);
+        handles.push(thread::spawn(move || loop {
+            let job = {
+                let mut queue = queue.lock().expect("port queue lock poisoned");
+                queue.pop_front()
+            };
+
+            let Some((index, port)) = job else {
+                break;
+            };
+
             let state = resolve_socket_addrs(&host, port)
                 .map(|mut addrs| {
                     addrs
@@ -65,17 +83,22 @@ pub fn scan_ports(host: &str, ports: &[u16], timeout: Duration) -> Vec<PortResul
                 })
                 .unwrap_or(PortState::Unresolved);
 
-            (index, PortResult { port, state })
+            let mut results = results.lock().expect("port results lock poisoned");
+            results[index] = Some(PortResult { port, state });
         }));
     }
 
-    let mut ordered = vec![None; ports.len()];
     for handle in handles {
-        let (index, result) = handle.join().expect("port scan thread panicked");
-        ordered[index] = Some(result);
+        handle.join().expect("port scan worker panicked");
     }
 
-    ordered.into_iter().flatten().collect()
+    Arc::try_unwrap(results)
+        .expect("port results still referenced")
+        .into_inner()
+        .expect("port results lock poisoned")
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
@@ -150,6 +173,10 @@ fn is_public_resource_present(client: &Client, url: &Url) -> bool {
         .send()
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+fn worker_count_for_len(requested: usize, len: usize) -> usize {
+    requested.max(1).min(len.max(1))
 }
 
 fn resolve_socket_addrs(

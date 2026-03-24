@@ -15,7 +15,8 @@ Instead, it focuses on low-risk checks that are appropriate for authorized asses
 - public path probing for common routes and metadata files
 - visible rate-limiting detection through repeated requests
 - JSON output for automation and tool chaining
-- concurrent probing for faster audits
+- schema versioning for stable JSON consumers
+- configurable concurrency for faster, bounded audits
 
 ## Features
 
@@ -25,13 +26,14 @@ Runs the full defensive audit workflow against an authorized target:
 - requests the base URL and reports server/header metadata
 - checks common public paths such as `/login`, `/admin`, `/robots.txt`, and `/sitemap.xml`
 - performs a light rate-limit probe and reports `429`, `Retry-After`, and `X-RateLimit-Remaining` indicators
-- runs port scanning, web probing, path checks, and rate-limit checks concurrently to reduce total runtime
+- runs independent audit stages concurrently to reduce total runtime
+- respects `--workers` for bounded port and path probing
 
 ### `ports`
-Checks whether specific TCP ports are reachable on a host.
+Checks whether specific TCP ports are reachable on a host, with configurable worker count.
 
 ### `web`
-Performs HTTP-focused checks without TCP port scanning.
+Performs HTTP-focused checks with configurable worker count for public path probing.
 
 ### `rate`
 Sends repeated requests to detect visible rate-limiting behavior.
@@ -39,6 +41,7 @@ Sends repeated requests to detect visible rate-limiting behavior.
 ## Output Formats
 
 Each command supports `--output text` and `--output json`.
+JSON responses include a top-level `schema_version` field so automation can pin against a stable output contract.
 
 Example JSON output:
 
@@ -46,13 +49,25 @@ Example JSON output:
 cargo run -- audit https://example.com --output json
 ```
 
+## Concurrency Controls
+
+- `audit --workers <N>` controls concurrent port and path probe workers
+- `ports --workers <N>` controls concurrent TCP port probe workers
+- `web --workers <N>` controls concurrent public path probe workers
+
+Example:
+
+```bash
+cargo run -- audit https://example.com --workers 4 --output json
+```
+
 ## Project Structure
 
-- `src/main.rs`: CLI parsing, output selection, and concurrent command orchestration
-- `src/scanner.rs`: concurrent TCP connect checks and HTTP header inspection
-- `src/file.rs`: safe public path probing and path helpers
+- `src/main.rs`: CLI parsing, output selection, schema-aware reports, and concurrent command orchestration
+- `src/scanner.rs`: bounded-concurrency TCP connect checks and HTTP header inspection
+- `src/file.rs`: safe public path probing, worker control, and path helpers
 - `src/rate_limit.rs`: repeated-request rate-limit detection and tests
-- `src/report.rs`: text and JSON output formatting
+- `src/report.rs`: text and JSON output formatting with schema versioning
 
 ## Requirements
 
@@ -77,25 +92,25 @@ cargo test
 Run a full audit:
 
 ```bash
-cargo run -- audit https://example.com --host example.com --ports 80,443,8080 --paths /login,/admin,/api/health --rate-requests 8
+cargo run -- audit https://example.com --host example.com --ports 80,443,8080 --paths /login,/admin,/api/health --rate-requests 8 --workers 4
 ```
 
 Run a full audit with JSON output:
 
 ```bash
-cargo run -- audit https://example.com --output json
+cargo run -- audit https://example.com --workers 4 --output json
 ```
 
 Port-only checks:
 
 ```bash
-cargo run -- ports example.com --ports 80,443,8443
+cargo run -- ports example.com --ports 80,443,8443 --workers 6
 ```
 
 HTTP checks only:
 
 ```bash
-cargo run -- web https://example.com --paths /,/login,/robots.txt --output json
+cargo run -- web https://example.com --paths /,/login,/robots.txt --workers 4 --output json
 ```
 
 Rate-limit probe:
@@ -110,6 +125,7 @@ cargo run -- rate https://example.com --requests 10
 - A `200`, `401`, or `403` on a public path can still be useful because it confirms route exposure without attempting bypasses.
 - Rate-limiting detection is heuristic. Some systems enforce limits per IP, token, or time window in ways this lightweight probe may not trigger.
 - Concurrency is used for independent probes, but the repeated requests inside rate-limit detection remain sequential so the observations preserve order.
+- JSON consumers should validate `schema_version` before assuming field compatibility.
 
 ## Safety Scope
 

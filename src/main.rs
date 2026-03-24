@@ -72,6 +72,12 @@ enum Commands {
         rate_requests: usize,
         #[arg(long, default_value_t = 10, help = "HTTP timeout in seconds")]
         timeout_secs: u64,
+        #[arg(
+            long,
+            default_value_t = 8,
+            help = "Max concurrent workers for port and path probes"
+        )]
+        workers: usize,
         #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
         output: CliOutputFormat,
     },
@@ -82,6 +88,12 @@ enum Commands {
         ports: Vec<u16>,
         #[arg(long, default_value_t = 800)]
         timeout_ms: u64,
+        #[arg(
+            long,
+            default_value_t = 8,
+            help = "Max concurrent workers for TCP port probes"
+        )]
+        workers: usize,
         #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
         output: CliOutputFormat,
     },
@@ -92,6 +104,12 @@ enum Commands {
         paths: Vec<String>,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+        #[arg(
+            long,
+            default_value_t = 8,
+            help = "Max concurrent workers for path probes"
+        )]
+        workers: usize,
         #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
         output: CliOutputFormat,
     },
@@ -125,6 +143,7 @@ fn run() -> Result<()> {
             paths,
             rate_requests,
             timeout_secs,
+            workers,
             output,
         } => {
             let base_url = parse_url(&url)?;
@@ -147,27 +166,29 @@ fn run() -> Result<()> {
                     &host_for_ports,
                     &ports_for_thread,
                     Duration::from_millis(800),
+                    workers,
                 )
             });
             let web_client = client.clone();
             let web_handle = thread::spawn(move || web_probe(&web_client, &base_for_web));
             let path_client = client.clone();
             let path_handle = thread::spawn(move || {
-                probe_common_paths(&path_client, &base_for_paths, &paths_for_thread)
+                probe_common_paths(&path_client, &base_for_paths, &paths_for_thread, workers)
             });
             let rate_client = client.clone();
             let rate_handle = thread::spawn(move || {
                 probe_rate_limiting(&rate_client, &base_for_rate, rate_requests)
             });
 
-            let report = AuditReport {
-                target_url: base_url.to_string(),
-                host: target_host,
-                ports: port_handle.join().expect("port scan thread panicked"),
-                web: web_handle.join().expect("web probe thread panicked")?,
-                paths: path_handle.join().expect("path probe thread panicked")?,
-                rate_limit: rate_handle.join().expect("rate-limit thread panicked")?,
-            };
+            let report = AuditReport::new(
+                base_url.to_string(),
+                target_host,
+                workers,
+                port_handle.join().expect("port scan thread panicked"),
+                web_handle.join().expect("web probe thread panicked")?,
+                path_handle.join().expect("path probe thread panicked")?,
+                rate_handle.join().expect("rate-limit thread panicked")?,
+            );
 
             emit_audit_report(&report, output.into());
         }
@@ -175,18 +196,21 @@ fn run() -> Result<()> {
             host,
             ports,
             timeout_ms,
+            workers,
             output,
         } => {
-            let report = PortsOutput {
-                host: host.clone(),
-                ports: scan_ports(&host, &ports, Duration::from_millis(timeout_ms)),
-            };
+            let report = PortsOutput::new(
+                host.clone(),
+                workers,
+                scan_ports(&host, &ports, Duration::from_millis(timeout_ms), workers),
+            );
             emit_ports_report(&report, output.into());
         }
         Commands::Web {
             url,
             paths,
             timeout_secs,
+            workers,
             output,
         } => {
             let base_url = parse_url(&url)?;
@@ -198,14 +222,16 @@ fn run() -> Result<()> {
             let path_values = paths.clone();
 
             let web_handle = thread::spawn(move || web_probe(&web_client, &web_base));
-            let path_handle =
-                thread::spawn(move || probe_common_paths(&path_client, &path_base, &path_values));
+            let path_handle = thread::spawn(move || {
+                probe_common_paths(&path_client, &path_base, &path_values, workers)
+            });
 
-            let report = WebOutput {
-                target_url: base_url.to_string(),
-                web: web_handle.join().expect("web probe thread panicked")?,
-                paths: path_handle.join().expect("path probe thread panicked")?,
-            };
+            let report = WebOutput::new(
+                base_url.to_string(),
+                workers,
+                web_handle.join().expect("web probe thread panicked")?,
+                path_handle.join().expect("path probe thread panicked")?,
+            );
             emit_web_report(&report, output.into());
         }
         Commands::Rate {
@@ -216,10 +242,10 @@ fn run() -> Result<()> {
         } => {
             let base_url = parse_url(&url)?;
             let client = build_client(timeout_secs)?;
-            let report = RateOutput {
-                target_url: base_url.to_string(),
-                rate_limit: probe_rate_limiting(&client, &base_url, requests)?,
-            };
+            let report = RateOutput::new(
+                base_url.to_string(),
+                probe_rate_limiting(&client, &base_url, requests)?,
+            );
             emit_rate_report(&report, output.into());
         }
     }
