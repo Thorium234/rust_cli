@@ -12,6 +12,16 @@ use std::thread;
 use std::time::Duration;
 use url::Url;
 
+use crate::security_checks::{
+    analyze_cache_control, analyze_csp_directives, analyze_cookies_enhanced, analyze_cors_preflight,
+    analyze_security_headers, check_clickjacking_protection, check_hsts_preload,
+    check_protocol_support, check_subresource_integrity, check_tls_config, detect_information_disclosure,
+    detect_mixed_content, probe_http_methods, review_robots_txt, validate_security_txt,
+    CacheControlReport, ClickjackingReport, CorsPreflightReport, EnhancedCookieCheck,
+    Finding, HeaderFinding, HstsPreloadReport, InfoDisclosureReport, MethodProbe,
+    ProtocolSupportReport, RobotsReviewReport, SecurityTxtReport, Severity, SriReport, TlsConfigReport,
+};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortState {
@@ -44,13 +54,29 @@ pub struct WebReport {
     pub powered_by: Option<String>,
     pub content_type: Option<String>,
     pub security_headers: Vec<HeaderCheck>,
+    pub security_header_findings: Vec<HeaderFinding>,
+    pub csp_findings: Vec<Finding>,
     pub robots_txt_present: bool,
     pub sitemap_present: bool,
     pub tls: TlsInfo,
+    pub tls_config: TlsConfigReport,
     pub redirects: Vec<RedirectHop>,
     pub cookies: Vec<CookieCheck>,
+    pub enhanced_cookies: Vec<EnhancedCookieCheck>,
     pub cors: CorsCheck,
+    pub cors_preflight: CorsPreflightReport,
     pub tech: TechFingerprint,
+    pub method_probes: Vec<MethodProbe>,
+    pub cache_control: CacheControlReport,
+    pub mixed_content: Vec<crate::security_checks::MixedContentFinding>,
+    pub info_disclosure: InfoDisclosureReport,
+    pub hsts_preload: HstsPreloadReport,
+    pub clickjacking: ClickjackingReport,
+    pub protocol_support: ProtocolSupportReport,
+    pub robots_review: Option<RobotsReviewReport>,
+    pub security_txt: Option<SecurityTxtReport>,
+    pub sri: Option<SriReport>,
+    pub all_findings: Vec<Finding>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +185,9 @@ pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
     let final_url = response.url().to_string();
     let status = response.status().as_u16();
     let headers = response.headers().clone();
+    let body_text = response.text().unwrap_or_default();
 
+    // Basic security headers (legacy format for backward compat)
     let security_headers = [
         "strict-transport-security",
         "content-security-policy",
@@ -181,23 +209,121 @@ pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
 
     let robots_url = base_url.join("robots.txt").ok();
     let sitemap_url = base_url.join("sitemap.xml").ok();
+    let security_txt_url = base_url.join(".well-known/security.txt").ok();
     let robots_client = client.clone();
     let sitemap_client = client.clone();
+    let sectxt_client = client.clone();
 
     let robots_handle = thread::spawn(move || match robots_url {
-        Some(url) => is_public_resource_present(&robots_client, &url),
-        None => false,
+        Some(url) => fetch_resource_text(&robots_client, &url),
+        None => None,
     });
     let sitemap_handle = thread::spawn(move || match sitemap_url {
         Some(url) => is_public_resource_present(&sitemap_client, &url),
         None => false,
     });
+    let sectxt_handle = thread::spawn(move || match security_txt_url {
+        Some(url) => fetch_resource_text(&sectxt_client, &url),
+        None => None,
+    });
 
+    // Professional security checks
+    let security_header_findings = analyze_security_headers(&headers);
+    let csp_findings = headers
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| analyze_csp_directives(v))
+        .unwrap_or_default();
     let tls = inspect_tls_info(base_url);
+    let tls_config = check_tls_config(base_url);
     let redirects = extract_redirect_chain(client, base_url);
     let cookies = analyze_cookies(&headers);
+    let is_https = base_url.scheme() == "https";
+    let enhanced_cookies = analyze_cookies_enhanced(&headers, is_https);
     let cors = check_cors_headers(&headers);
+    let cors_preflight = analyze_cors_preflight(client, base_url);
     let tech = fingerprint_technologies(&headers);
+    let method_probes = probe_http_methods(client, base_url);
+    let has_set_cookie = headers.contains_key(reqwest::header::SET_COOKIE);
+    let cache_control = analyze_cache_control(&headers, has_set_cookie);
+    let mixed_content = detect_mixed_content(&body_text, base_url);
+    let info_disclosure = detect_information_disclosure(&headers);
+    let hsts_preload = check_hsts_preload(&headers);
+    let clickjacking = check_clickjacking_protection(&headers);
+    let protocol_support = check_protocol_support(client, base_url);
+
+    let robots_txt_result = robots_handle.join().expect("robots probe thread panicked");
+    let robots_review = robots_txt_result.as_ref().map(|body| review_robots_txt(body));
+    let security_txt_result = sectxt_handle.join().expect("security.txt probe thread panicked");
+    let security_txt_report = security_txt_result.as_ref().map(|body| validate_security_txt(body));
+
+    // SRI check
+    let sri = if body_text.contains("<script") || body_text.contains("<link") {
+        Some(check_subresource_integrity(&body_text, base_url))
+    } else {
+        None
+    };
+
+    // Aggregate all findings
+    let mut all_findings = Vec::new();
+    for hf in &security_header_findings {
+        if let Some(ref f) = hf.finding {
+            all_findings.push(f.clone());
+        }
+    }
+    all_findings.extend(csp_findings.clone());
+    all_findings.extend(tls_config.findings.clone());
+    for ec in &enhanced_cookies {
+        all_findings.extend(ec.findings.clone());
+    }
+    all_findings.extend(cors_preflight.findings.clone());
+    all_findings.extend(cache_control.findings.clone());
+    all_findings.extend(clickjacking.findings.clone());
+    if let Some(ref st) = security_txt_report {
+        all_findings.extend(st.findings.clone());
+    }
+
+    // Add method risks as findings
+    for mp in &method_probes {
+        if let Some(ref risk) = mp.risk {
+            let sev = if risk.contains("Critical") || risk.contains("deletion") || risk.contains("upload") {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
+            all_findings.push(Finding::new(
+                &format!("METHOD-{}", mp.method),
+                &format!("HTTP {} method risk", mp.method),
+                sev,
+                risk,
+                "Review and disable unnecessary HTTP methods on the server.",
+            ).with_detail(format!("Method: {}, Status: {:?}", mp.method, mp.status)));
+        }
+    }
+
+    // Add info disclosure findings
+    for disc in &info_disclosure.disclosing_headers {
+        all_findings.push(Finding::new(
+            "INFO-DISCLOSE",
+            &format!("Information disclosure via {}", disc.header),
+            disc.severity,
+            &format!("{}: {}", disc.disclosure_type, disc.value),
+            "Remove or suppress version-disclosing headers.",
+        ));
+    }
+
+    // Add mixed content findings
+    for mc in &mixed_content {
+        all_findings.push(Finding::new(
+            "MIXED-CONTENT",
+            &format!("Mixed content: {} from {}", mc.element_type, mc.url),
+            mc.severity,
+            &format!("{} content loaded over HTTP on an HTTPS page", mc.element_type),
+            "Change all resource URLs to HTTPS.",
+        ).with_detail(format!("Element: {}, URL: {}", mc.element_type, mc.url)));
+    }
+
+    all_findings.sort_by(|a, b| a.severity.cmp(&b.severity));
 
     Ok(WebReport {
         final_url,
@@ -215,15 +341,29 @@ pub fn web_probe(client: &Client, base_url: &Url) -> Result<WebReport> {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
         security_headers,
-        robots_txt_present: robots_handle.join().expect("robots probe thread panicked"),
-        sitemap_present: sitemap_handle
-            .join()
-            .expect("sitemap probe thread panicked"),
+        security_header_findings,
+        csp_findings,
+        robots_txt_present: robots_txt_result.is_some(),
+        sitemap_present: sitemap_handle.join().expect("sitemap probe thread panicked"),
         tls,
+        tls_config,
         redirects,
         cookies,
+        enhanced_cookies,
         cors,
+        cors_preflight,
         tech,
+        method_probes,
+        cache_control,
+        mixed_content,
+        info_disclosure,
+        hsts_preload,
+        clickjacking,
+        protocol_support,
+        robots_review,
+        security_txt: security_txt_report,
+        sri,
+        all_findings,
     })
 }
 
@@ -233,6 +373,15 @@ fn is_public_resource_present(client: &Client, url: &Url) -> bool {
         .send()
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+fn fetch_resource_text(client: &Client, url: &Url) -> Option<String> {
+    client
+        .get(url.as_str())
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.text().ok())
 }
 
 fn inspect_tls_info(url: &Url) -> TlsInfo {

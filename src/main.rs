@@ -2,6 +2,7 @@ mod file;
 mod rate_limit;
 mod report;
 mod scanner;
+mod security_checks;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
