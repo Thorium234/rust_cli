@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::blocking::Client;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::file::probe_common_paths;
@@ -161,33 +161,51 @@ fn run() -> Result<()> {
             let base_for_paths = base_url.clone();
             let base_for_rate = base_url.clone();
             let host_for_ports = target_host.clone();
+
             let port_handle = thread::spawn(move || {
-                scan_ports(
+                let start = Instant::now();
+                let results = scan_ports(
                     &host_for_ports,
                     &ports_for_thread,
                     Duration::from_millis(800),
                     workers,
-                )
+                );
+                (results, start.elapsed())
             });
+            let web_start = Instant::now();
             let web_client = client.clone();
             let web_handle = thread::spawn(move || web_probe(&web_client, &base_for_web));
+            let path_start = Instant::now();
             let path_client = client.clone();
             let path_handle = thread::spawn(move || {
                 probe_common_paths(&path_client, &base_for_paths, &paths_for_thread, workers)
             });
+            let rate_start = Instant::now();
             let rate_client = client.clone();
             let rate_handle = thread::spawn(move || {
                 probe_rate_limiting(&rate_client, &base_for_rate, rate_requests)
             });
 
+            let (ports_data, duration_ports) = port_handle.join().expect("port scan thread panicked");
+            let web_result = web_handle.join().expect("web probe thread panicked")?;
+            let duration_web = web_start.elapsed();
+            let paths = path_handle.join().expect("path probe thread panicked")?;
+            let duration_paths = path_start.elapsed();
+            let rate = rate_handle.join().expect("rate-limit thread panicked")?;
+            let duration_rate = rate_start.elapsed();
+
             let report = AuditReport::new(
                 base_url.to_string(),
                 target_host,
                 workers,
-                port_handle.join().expect("port scan thread panicked"),
-                web_handle.join().expect("web probe thread panicked")?,
-                path_handle.join().expect("path probe thread panicked")?,
-                rate_handle.join().expect("rate-limit thread panicked")?,
+                ports_data,
+                web_result,
+                paths,
+                rate,
+                duration_ports,
+                duration_web,
+                duration_paths,
+                duration_rate,
             );
 
             emit_audit_report(&report, output.into());

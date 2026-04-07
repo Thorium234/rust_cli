@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::time::Duration;
 use url::Url;
 
 use crate::file::PathProbe;
@@ -24,6 +25,10 @@ pub struct AuditReport {
     pub web: WebReport,
     pub paths: Vec<PathProbe>,
     pub rate_limit: RateLimitReport,
+    pub duration_ports: Duration,
+    pub duration_web: Duration,
+    pub duration_paths: Duration,
+    pub duration_rate: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +64,10 @@ impl AuditReport {
         web: WebReport,
         paths: Vec<PathProbe>,
         rate_limit: RateLimitReport,
+        duration_ports: Duration,
+        duration_web: Duration,
+        duration_paths: Duration,
+        duration_rate: Duration,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -69,6 +78,10 @@ impl AuditReport {
             web,
             paths,
             rate_limit,
+            duration_ports,
+            duration_web,
+            duration_paths,
+            duration_rate,
         }
     }
 }
@@ -153,6 +166,14 @@ fn print_report(report: &AuditReport) {
     );
     println!();
     print_rate_report(&parse_url(&report.target_url), report.rate_limit.clone());
+    println!();
+    println!("== Timing Summary ==");
+    println!("  Ports:  {:?}", report.duration_ports);
+    println!("  Web:    {:?}", report.duration_web);
+    println!("  Paths:  {:?}", report.duration_paths);
+    println!("  Rate:   {:?}", report.duration_rate);
+    let total = report.duration_ports + report.duration_web + report.duration_paths + report.duration_rate;
+    println!("  Total:  {:?}", total);
 }
 
 pub fn print_port_report(host: &str, port_report: &[PortResult]) {
@@ -189,6 +210,68 @@ pub fn print_web_report(base_url: &Url, web_report: WebReport, path_report: Vec<
         let value = header.value.unwrap_or_else(|| "-".to_string());
         println!("  {:<28} {:<8} {}", header.name, status, value);
     }
+
+    // TLS info
+    println!("TLS:");
+    if web_report.tls.enabled {
+        println!("  Enabled: yes");
+        if let Some(ref subject) = web_report.tls.subject {
+            println!("  Subject: {subject}");
+        }
+        if let Some(ref issuer) = web_report.tls.issuer {
+            println!("  Issuer: {issuer}");
+        }
+        if let Some(ref expiry) = web_report.tls.expiry {
+            println!("  Expiry: {expiry}");
+        }
+        if let Some(days) = web_report.tls.days_until_expiry {
+            println!("  Days until expiry: {days}");
+        }
+        if !web_report.tls.san.is_empty() {
+            println!("  SANs: {}", web_report.tls.san.join(", "));
+        }
+    } else {
+        println!("  Enabled: no (HTTP only)");
+    }
+
+    // Redirect chain
+    if !web_report.redirects.is_empty() {
+        println!("Redirect chain:");
+        for hop in &web_report.redirects {
+            println!("  [{}] {} -> {} ({})", hop.index, hop.from_url, hop.to_url, hop.status);
+        }
+    }
+
+    // Cookie security
+    if !web_report.cookies.is_empty() {
+        println!("Cookie security:");
+        for cookie in &web_report.cookies {
+            let flags = [
+                if cookie.secure { "Secure" } else { "!Secure" },
+                if cookie.httponly { "HttpOnly" } else { "!HttpOnly" },
+                cookie.samesite.as_deref().unwrap_or("!SameSite"),
+            ].join(", ");
+            println!("  {} [{flags}]", cookie.name);
+        }
+    }
+
+    // CORS
+    println!("CORS:");
+    if web_report.cors.header_present {
+        let origin = web_report.cors.allow_origin.as_deref().unwrap_or("not set");
+        let wildcard = if web_report.cors.wildcard_origin { " (wildcard!)" } else { "" };
+        let creds = web_report.cors.allow_credentials.as_deref().unwrap_or("not set");
+        println!("  Allow-Origin: {origin}{wildcard}");
+        println!("  Allow-Credentials: {creds}");
+    } else {
+        println!("  No CORS headers detected");
+    }
+
+    // Technology fingerprint
+    if !web_report.tech.detected_technologies.is_empty() {
+        println!("Detected technologies: {}", web_report.tech.detected_technologies.join(", "));
+    }
+
     println!("Public path checks:");
     for item in path_report {
         let status = item

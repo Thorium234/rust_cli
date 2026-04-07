@@ -23,6 +23,21 @@ const DEFAULT_PATHS: &[&str] = &[
     "/.well-known/security.txt",
     "/robots.txt",
     "/sitemap.xml",
+    "/.env",
+    "/.git",
+    "/.git/config",
+    "/wp-admin",
+    "/wp-login.php",
+    "/phpinfo.php",
+    "/server-status",
+    "/server-info",
+    "/actuator",
+    "/actuator/health",
+    "/debug",
+    "/console",
+    "/swagger-ui.html",
+    "/api/docs",
+    "/graphql",
 ];
 
 pub fn probe_common_paths(
